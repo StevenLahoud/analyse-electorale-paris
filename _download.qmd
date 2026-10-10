@@ -1,0 +1,121 @@
+```{r}
+#| label: download-libraries
+
+library(tidyverse)
+library(fs)
+
+```
+
+```{r}
+#| label: download-functions
+
+api_prefix <- "https://opendata.paris.fr/api/explore/v2.1/catalog/datasets/{dataset}/"
+api_export <- str_c(api_prefix, "exports/{format}")
+api_attachement <- str_c(api_prefix, "attachments/{attachement}")
+
+dl_parquet <- function(dataset, path) {
+  if (!file_exists(path)) {
+    message("Downloading ", path_file(path))
+    download.file(str_glue(api_export, format = "parquet"), path, mode = "wb")
+  }
+}
+
+dl_excel <- function(dataset, attachement, path) {
+  if (!file_exists(path)) {
+    message("Downloading ", path_file(path))
+    download.file(str_glue(api_attachement), path, mode = "wb")
+  }
+}
+
+```
+
+
+```{r}
+#| label: download
+
+if (!dir_exists("DATA")) {
+  message("Creating directory DATA in ", getwd())
+  dir_create("DATA")
+}
+
+## Download the datasets that are available as parquets ##
+to_dl <- c(
+  "elections-presidentielles-2007-1ertour", "elections-presidentielles-2007-2emetour",
+  "elections-presidentielles-2017-1ertour", "elections-presidentielles-2017-2emetour",
+  "elections-presidentielles2022-1ertour" , "elections-presidentielles-2022-2emetour",
+  "elections-europeennes-2014",
+  "elections-europeennes-2024"
+)
+
+# Split dataset names on - or when a letter is followed by a digit
+parsed <- str_split(to_dl, "-|(?<=[:lower:])(?=[:digit:])")
+
+pres_euro <- tibble(
+  dataset = to_dl,
+  type = map_chr(parsed, 2),
+  year = map_chr(parsed, 3) |> as.integer(),
+  round = map_chr(parsed, 4, .default = "1") |> str_sub(end = 1) |> as.integer(),
+  path = fs::path("DATA", str_c(str_sub(type, end = 4), year, round, sep = "_"), ext = "parquet") |> as.character()
+)
+
+walk2(pres_euro$dataset, pres_euro$path, dl_parquet)
+
+## Download the datasets that are only available as excel sheets ##
+pad2 <- function(i) str_pad(i, width = 2, pad = '0')
+
+to_dl <- tribble(
+  ~attachement, ~constituency,
+
+  "ddct_berp_legislatives_2007_tour1_circ_{pad2(i)}_20070610_xlsx", 1:21,
+  "ddct_berp_legislatives_2007_tour2_circ_{pad2(i)}_20070617_xls", c(1:2, 5:13, 17:21),
+
+  "ddct_berp_legislatives_2017_tour1_circ_{pad2(i)}_20170611_xlsx", 1:18,
+  "ddct_berp_legislatives_2017_tour2_circ_{pad2(i)}_20170618_xlsx", 2:18,
+
+  "ddct_berp_legislatives_2022_tour1_circ_{pad2(i)}_20220612_xlsx", 1:18,
+  "ddct_berp_legislatives_2022_tour2_circ_{pad2(i)}_20220619_xlsx", c(1:5, 7:15, 18L),
+
+  "ddct_berp_legislatives_2024_tour1_circ_{pad2(i)}_20240630_xlsx", 1:18,
+  "ddct_berp_legislatives_2024_tour2_circ_{pad2(i)}_20240707_xlsx", c(1:4, 11:15),
+
+  "ddct_berp_municipales_2008_tour1_ardt_{pad2(i)}_20080310_xls", 1:20,
+  "ddct_berp_municipales_2008_tour2_ardt_{pad2(i)}_20080317_xlsx", c(1:2, 4:10, 12:15, 17:18, 20L),
+
+  "ddct_berp_municipales_2020_tour1_ardt_{pad2(i)}_20200315_xls", 1:20,
+  "ddct_berp_municipales_2020_tour2_ardt_{pad2(i)}_20200628_xls", c(1:6, 8:20),
+)
+
+parsed <- str_split(to_dl$attachement, "_")
+
+legi_muni <- to_dl |>
+  mutate(
+    type = map_chr(parsed, 3),
+    year = map_chr(parsed, 4) |> as.integer(),
+    round = map_chr(parsed, 5) |> str_sub(start = -1) |> as.integer(),
+    dataset = str_c("elections", type, year, if_else(round == 1, '1ertour', '2emetour'), sep = '-'),
+    path = fs::path("DATA", str_c(str_sub(type, end = 4), year, round, "{i}", sep = "_"), ext = map_chr(parsed, -1))
+  ) |>
+  rows_update( # inconsistency in the naming of datasets
+    tibble(type = "legislatives", year = 2007, round = 2, dataset = "elections-legislatives-2007-2emetour0"),
+    by = c("type", "year", "round")
+  ) |>
+  unnest(constituency) |>
+  rowwise() |>
+  mutate(
+    attachement = str_glue(attachement, i = constituency),
+    path = str_glue(path, i = constituency) |> as.character()
+  ) |>
+  ungroup()
+
+pwalk(select(legi_muni, dataset, attachement, path), dl_excel)
+
+```
+
+```{r}
+#| label: download-clean
+
+# clear all variables except elections
+rm(api_attachement, api_export, api_prefix, dl_excel, dl_parquet, to_dl, parsed, pad2)
+detach(package:fs)
+
+```

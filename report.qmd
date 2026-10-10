@@ -1,0 +1,486 @@
+---
+title: Elections in Paris under the prism of SVD
+format: html
+---
+
+{{< include _load_data.qmd >}}
+{{< include _utils.qmd >}}
+{{< include _parties.qmd >}}
+
+```{r}
+#| label: report-libraries
+
+library(FactoMineR)
+library(factoextra)
+library(patchwork)
+library(gt)
+library(sf)
+library(generics)
+library(broom)
+library(CCA)
+
+select <- dplyr::select
+
+```
+
+# Our Dataset
+
+This project analyzes electoral results in Paris since 2007, the first year covered by the official open data archives. Because sixteen elections have taken place over that period, we focus on a curated subset that we find the most interesting for our analysis. The following table summarizes the elections we retained:
+
+
+| Election type | Years                  |
+|---------------|------------------------|
+| Presidential  | 2007, 2017, 2022       |
+| European      | 2014, 2024             |
+| Legislative   | 2007, 2017, 2022, 2024 |
+| Municipal     | 2008, 2020             |
+
+These elections span the whole 2007-2024 period, which makes it possible to observe how voting patterns evolve over time. We also include every election from 2017 onward because the assignment requires it for the linear regression used to explain the 2024 legislative election.
+
+For each election, we work with a table in which each row corresponds to a polling station. The first 15 columns contain information about the election and the station itself, such as its location, the number of registered voters, and the number of cast ballots. The remaining columns correspond to the candidates and record the number of votes each one received at that polling station.
+
+The following example shows a sample of the data for the first round of the 2017 presidential election:
+
+```{r}
+#| label: sample
+
+elections |>
+  filter(type == "presidentielles", year == 2017, round == 1) |>
+  pluck("data", 1) |>
+  select(!c(geo_shape, geo_point_2d)) |>
+  rename_with(format_names) |>
+  sample_n(5) |>
+  gt() |>
+  tab_header(title = "2017 Presidential elections, 1st round")
+
+```
+
+At first glance, the most popular candidates among Parisians were *Emmanuel Macron*, *Jean-Luc Mélenchon*, and *François Fillon*.
+
+
+# Using Principal Component Analysis (PCA)
+
+In this section, we will perform PCA on the columns containing the results of the candidates for multiple elections and showcase some characteristics of the Parisian political landscape.
+
+Since elections tend to have quite a lot of candidates obtaining only a few votes, we focused our analysis on the 6 best-scoring candidates of each election. We also ignore second rounds because having only two variables is not a very informative setup for PCA.
+
+```{r}
+#| label: pca
+
+pcomps <- elections |>
+  mutate(
+    pco = map(data, \(df) prcomp(candidates(df) |> top_n(6) |> rename_with(format_names), scale. = TRUE)),
+    title = str_glue("{str_to_title(str_sub(type, end = 4))}. {year}, tour {round}")
+  )
+
+```
+
+## The Evolution of the Presidential Landscape (2007-2017-2022)
+
+```{r}
+#| label: pca-pres
+
+pcomps.pres <- filter(pcomps, type == "presidentielles", round == 1)
+
+```
+
+Let us start with the most well-known election: the presidential election. For these elections, the top performing candidates are as follows:
+
+```{r}
+#| label: top-pres
+
+pcomps.pres |>
+  mutate(cand = map(pco, \(x) names(x$center))) |>
+  select(Year = year, Candidates = cand) |>
+  gt()
+
+```
+
+We first inspect the scree plots to check whether a two-dimensional representation is appropriate.
+
+```{r}
+#| label: pca-pres-screeplot
+
+pcomps.pres |>
+  pmap(\(pco, title, ...) fviz_screeplot(pco, addlabels = TRUE, main = title)) |>
+  wrap_plots(axes = "collect")
+
+```
+
+In every PCA, the first two principal axes explain at least 75% of the total variance. The elbow is not as sharp as one would usually hope for, but the remaining variance is still limited enough for us to focus on the correlation circles:
+
+```{r}
+#| label: pca-pres-var
+#| lightbox:
+#|  group: pca-pres-var
+#| layout-ncol: 3
+
+
+pcomps.pres |>
+  pmap(\(pco, title, ...) fviz_pca_var(pco, col.var = "royalblue", repel = TRUE, title = title)) |>
+  walk(print)
+
+```
+
+#### 2007
+* **The classic left-right divide:** The horizontal axis clearly opposes *Nicolas Sarkozy* on the right with *Ségolène Royal* and *Olivier Besancenot* on the left. This reproduces the traditional left-right divide of the Fifth Republic.
+* **The center vs. the extremes:** The vertical axis is equally interesting. It sets *François Bayrou*, the centrist candidate, against *Jean-Marie Le Pen*, who sat at the far end of the political spectrum at the time.
+
+#### 2017
+* **The left-right divide remains:** The horizontal axis still captures the traditional opposition between the Right (*François Fillon*) and the Left (*Jean-Luc Mélenchon* and *Benoît Hamon*).
+* **Growing alternatives:** The vertical axis becomes more informative and reveals a second division. It directly opposes *Emmanuel Macron* (pointing downward) and *Marine Le Pen* (pointing upward), which corresponds to the emergence of a new divide between progressivism/globalism and nationalism/populism.
+
+#### 2022
+* **A narrowing on the right:** *Valérie Pécresse* and *Éric Zemmour* are almost perfectly superimposed. In practical terms, this suggests that in Paris the traditional conservative right and the far right appealed to very similar social profiles and neighborhoods, likely in the more affluent western districts.
+* **The left bloc:** On the opposite side of the *Pécresse*/*Zemmour* cluster, *Jean-Luc Mélenchon* stands largely alone and dominates his half of the graph. This is consistent with support coming from more working-class and diverse eastern districts.
+* **Macron's shift to the right:** Compared with the previous election, *Emmanuel Macron* now leans toward right-wing candidates. This suggests that perceptions of his politics shifted after his first term, and that his position in 2022 appeared more right-leaning than it did in 2017.
+
+Since most of the political dynamic appears to be captured by the first principal axis, we now map each polling station according to its position on that axis:
+
+```{r}
+#| label: choropleth
+
+pcomps.pres |>
+  filter(year != 2007) |>
+  pmap(function(data, pco, title, ...) {
+      bind_cols(data, pco$x) |>
+      st_as_sf() |>
+      ggplot(aes(fill = PC1)) +
+      geom_sf() +
+      scale_fill_gradient2(low = "blue", high = "red") +
+      labs(title = title) +
+      theme_void()
+  }) |>
+  wrap_plots(ncol = 1)
+
+```
+
+As expected, the map reveals a clear west-right / east-left divide in Paris. The western districts, especially the 16th and 17th arrondissements, are associated with more right-leaning values of the first principal component, while the eastern districts, especially the 19th and 20th, are associated with more left-leaning values. The first axis therefore captures a large part of the territorial opposition between affluent western neighborhoods and more popular eastern ones.
+
+## European Elections (2014 vs 2024)
+
+```{r}
+#| label: pca-euro
+
+pcomps.euro <- filter(pcomps, type == "europeennes")
+
+```
+
+We use the same approach to analyze the two most recent European elections. Once again, checking the scree plots confirms that a two-dimensional representation is appropriate:
+
+```{r}
+#| label: pca-euro-screeplot
+
+pcomps.euro |>
+  pmap(\(pco, title, ...) fviz_screeplot(pco, addlabels = TRUE, main = title)) |>
+  wrap_plots(axes = "collect")
+
+```
+
+For a more compact view of the results, we focus on the biplots instead of the correlation circles. The biplots show both the candidates and the polling stations, which allows us to better understand how the candidates relate to each other and to the underlying social and territorial divides.
+
+```{r}
+#| label: pca-euro-biplot
+#| lightbox:
+#|  group: pca-euro-biplot
+#| layout-ncol: 2
+
+arrond_groups <- character()
+arrond_groups[c(7, 8, 16, 17)] <- "west (7, 8, 16, 17)"
+arrond_groups[c(1:6, 9:15, 18:20)] <- "not-west"
+
+pcomps.euro |>
+  pmap(function(pco, data, title, ...) {
+    fviz_pca_biplot(
+      pco, label = "var", col.var = "navy", title = title, repel = TRUE,
+      habillage = factor(arrond_groups[data$num_arrond])
+    )
+  }) |>
+  walk(\(x) print(x + coord_fixed()))
+
+```
+
+#### 2014
+* **PC1 (the left-right spectrum):** The main horizontal axis, which explains 55.5% of the variance, cleanly separates the traditional political families. On one side of the graph is the conservative right (*Alain Lamassoure*); on the other, a more dispersed left bloc (*Patrick Le Hyaric*, *Pascal Durand*, *Pervenche Berès*).
+
+* In 2014, Paris was still voting within a traditional multi-party system. No single candidate clearly dominated, and no major bloc had yet merged with another's sociological base.
+
+#### 2024
+* **Left-right shift:** The graph's orientation has flipped, which is perfectly normal in PCA, but the divide is still there. The left bloc (*Aubry*, *Toussaint*, *Glucksmann*) now appears on the left side, while the right/center bloc (*Bellamy*, *Hayer*, *Bardella*) is on the right.
+* **The Glucksmann/Toussaint convergence:** *Raphaël Glucksmann* (center-left) and *Marie Toussaint* (Greens) are roughly aligned, pointing to the same sociological space in the lower-left quadrant. In Paris, the moderate left and the ecologist electorate became quite similar in 2024, which is the strongest signal in this chart.
+* **A double polarization:** The second axis is an extremes/moderates divide. On the upper half of the graph, we find the extremes (*Jordan Bardella* on the far right and *Manon Aubry* on the far left), while the more moderate candidates (*Nicolas Hayer* and *Raphaël Glucksmann*) are in the lower half. This suggests that in 2024, the political landscape was not only structured by the traditional left-right divide, but also by a divide between moderate and more extreme candidates.
+
+
+# Using Canonical Correlation Analysis (CCA)
+
+This time we will focus on the municipal elections of 2008 and 2020. We will extract the top 2 candidates of each polling station for both elections, assign them a political label (Left, Right, Center, Ecologist) and then run a CCA to analyze the correlation between the two elections. The goal is to see how the political landscape of Paris evolved between 2008 and 2020, and whether the results of a political bloc in 2008 are indeed correlated with the results of the same bloc in 2020.
+
+```{r}
+#| label: cca
+
+top2_municipales <- function(select_year) {
+  elections |>
+    filter(type == "municipales", year == select_year, round == 1) |>
+    pluck("data") |>
+    map(function(df) {
+      df |>
+      pivot_longer(
+        cols = c(nb_exprim:last_col(), -nb_exprim),
+        names_to = "candidat",
+        values_to = "voix"
+      ) |>
+      mutate(pct = voix / nb_exprim * 100) |>
+      slice_max(by = id_bvote, order_by = pct, n = 2, with_ties = FALSE) |>
+      select(id_bvote, candidat, pct)
+    }) |>
+    bind_rows()
+}
+
+top2_muni_parties <- function(select_year) {
+  top2_municipales(select_year) |>
+    inner_join(dico, by = "candidat") |>
+    select(-candidat)
+}
+
+cca_data <- function(select_year) {
+  top2_muni_parties(select_year) |>
+  pivot_wider(
+    names_from = parti,
+    values_from = pct,
+    values_fill = 0,
+    values_fn = sum  # pour les doublons
+  ) |>
+  rename_with(\(x) str_glue("{x}_{select_year}"), -id_bvote)
+}
+
+cca_finale <- inner_join(cca_data(2008), cca_data(2020), by = "id_bvote")
+
+X <- cca_finale |> select(ends_with("_2008")) |> as.matrix()
+Y <- cca_finale |> select(ends_with("_2020")) |> as.matrix()
+
+res_cc <- cc(X, Y)
+plt.var(res_cc, 1, 2, var.label = TRUE)
+
+```
+
+Right_2008 and Right_2020 are basically right on top of each other on the far left, showing stability for the Right. However, while Left_2008 is touching the right edge, Left_2020 has moved closer to the center of the circle. This means that while the Left is still a major political power, its geographic hold became slightly less significant and more spread out in 2020 than it was in 2008.
+
+While the Left/Right axis remained frozen, the "Center" experienced a total geographic shift. Centre_2008 points upwards, whereas Centre_2020 points downwards. This opposition proves that the 2020 centrist electorate was built in completely different neighborhoods compared to the 2008 centrist base. The label remained, but the voters changed.
+
+Both Ecologiste_2008 and Ecologiste_2020 are positioned on the right side of the chart, sharing a close angle with the Left bloc. This confirms a persistent geographic correlation between Green voters and Left-wing voters, sharing very similar electoral zones.
+
+# Clustering
+
+## Analyzing the Legislative Electoral Dynamics
+
+```{r}
+#| label: clustering-functions
+
+legi_data <- function(select_year) {
+  collect_election("legislatives", select_year, 1) |>
+  rowwise() |>
+  mutate(
+    turnout = nb_votant / nb_inscr * 100,
+    procu = nb_procu / nb_votant * 100,
+    blanc = nb_bl_nul / nb_votant * 100,
+    tmp = c_across(16:last_col()) |> sort(decreasing = TRUE) |> list(),
+    best = tmp[1] / nb_votant * 100,
+    second = tmp[2] / nb_votant * 100,
+    gap = best - second,
+    .keep = "unused"
+  ) |>
+  select(-tmp)
+}
+
+add_geo <- function(df) {
+  if ("geo_shape" %in% names(df)) return(df)
+
+  y <- df$annee[1]
+  geo <- elections |>
+    filter(type %in% c("presidentielles", "europeennes"), year == y, round == 1) |>
+    pluck("data", 1) |>
+    select(id_bvote, geo_shape, geo_point_2d)
+
+  left_join(df, geo, by = "id_bvote")
+}
+
+cluster_analysis <- function(df) {
+  set.seed(22)
+  df <- df |>
+    select(gap, blanc) |>
+    scale() |>
+    kmeans(centers = 3, nstart = 32L) |>
+    augment(df)
+
+  scatter <- ggplot(df, aes(x = gap, y = blanc, color = .cluster)) +
+    geom_point() +
+    labs(
+      title = "Based on: Competitiveness (Gap) and Protest Vote (Blank)",
+      x = "Gap between 1st and 2nd candidate (%)",
+      y = "Blank & Null votes (%)",
+      color = "Cluster"
+    ) +
+    theme_minimal()
+
+  map <- df |>
+    add_geo() |>
+    st_as_sf() |>
+    ggplot(aes(fill = .cluster)) +
+    geom_sf() +
+    labs(
+      title = str_c("Map of Electoral Clusters (", df$annee[1], ")"),
+      fill = "Cluster"
+    ) +
+    theme_void()
+
+  print(scatter)
+  print(map)
+}
+
+```
+
+### 2017
+
+To better understand the voting dynamics during the Legislative elections, we clustered the polling stations based on two behavioral variables: the gap between the first and second candidate and the protest vote. The K-means algorithm naturally identified three distinct geographical and behavioral profiles:
+
+```{r}
+#| label: clustering-2017
+#| lightbox:
+#|  group: clustering-2017
+#| layout-ncol: 2
+
+cluster_analysis(legi_data(2017))
+
+```
+
+* **Cluster 1 (Red) The "Macron Wave" Strongholds:** On the scatter plot, this group is distinguished by massive leads (Gap > 20%) and low blank votes. However, on the 2017 map, this cluster overwhelmingly dominates the center and heart of Paris. This illustrates the landslide victory of "La République En Marche" (LREM) following *Emmanuel Macron*'s election. His candidates won monolithic victories in quite a lot of districts, surpassing the Left/Right divide in the capital's center.
+
+* **Cluster 2 (Green) Peripheral Uncertainty Zones:** Identified by high blank and null votes (above 1.5%), this cluster is found primarily on the northern, eastern, and southern fringes of Paris. In the 2017 context, following the decline of traditional parties (PS and LR), a portion of the electorate felt left without a strong local political alternative and chose blank voting to express their uncertainty.
+
+* **Cluster 3 (Blue) Pockets of Resistance (Battlegrounds):** Characterized by very tight races (low Gap, under 18%), this cluster was pushed to the geographical extremities of the capital: the far West (16th arrondissement) and fragments of the East. In 2017, these were the only areas where real competition persisted. They represent the final bastions of traditional parties (the historic Right in the West, the Left in the East) fighting fiercely against macronist candidates.
+
+### 2024
+
+Applying the same K-means clustering algorithm to the 2024 Legislative elections reveals a radically different electoral geography. At that time, the variables of competitiveness (Gap) and protest voting (Blank) drew the following landscape:
+
+```{r}
+#| label: clustering-2024
+#| lightbox:
+#|  group: clustering-2024
+#| layout-ncol: 2
+
+cluster_analysis(legi_data(2024))
+
+```
+
+* **Cluster 1 (Red) The Monolithic Strongholds:** Characterized by a comfortable lead for the winning candidate (Gap between 20% and 50%) and a low rate of blank votes. Geographically, this cluster dominates the 5th, 8th, 10th, 11th and 16th arrondissements. These are mostly neighborhoods with tight results in 2017 (blue cluster) that have returned to their traditional political allegiances in 2024 after the dissolution of the National Assembly by President *Macron*.
+
+* **Cluster 2 (Green) Uncertain Areas:** This cluster is primarily isolated by its high y-axis values (Blank & Null votes above 1.5%), regardless of the gap. As in 2017, these stations are mostly scattered on the outer edges of the capital, but they are more numerous and tend to spread inwards. This highlights specific areas where a significant portion of the electorate felt unrepresented by the local candidate offerings, choosing instead to cast a blank ballot to express dissatisfaction with the current political instability.
+
+* **Cluster 3 (Blue) The Battlegrounds:** Located in the lower-left quadrant of the scatter plot, these stations are defined by a tight race (Gap mostly under 20%) and low blank votes. On the map, they cover a massive central and center-western portion of Paris. These areas represent the political battlegrounds of the capital. It is interesting to note that these parts of Paris were previously the ones with not much competition. This new dynamic is likely due to people turning away from *Macron*'s party after he dissolved the national assembly which is a very unpopular move in France.
+
+### 2017 vs 2024
+
+In 2017, central Paris was entirely Red (crushing victories for the Macronist center). In 2024, this same center became massively Blue (highly competitive zones with very small gaps). The 2017 hegemony has vanished, replaced by a fierce struggle between three distinct blocs (NFP, Ensemble, RN/LR). Central Paris has returned to being a "battleground."
+
+Macron's arrival in 2017 acted as a "statistical anomaly," creating a massive central bloc of easy victories that temporarily erased the traditional map. By 2024, the clustering proves this anomaly has dissipated. The city is now hyper-polarized: easy victories are limited to the edges of the city, and every central district is the scene of intense electoral competition.
+
+
+# Linear regression
+
+```{r}
+#| label: lin-reg
+
+to_explain <- elections |>
+  filter(type == "legislatives", year == 2024, round == 1) |>
+  pluck("data") |>
+  map(function(x) {
+    x |>
+    candidates(keep = id_bvote) |>
+    top_n(1, start = 2)
+  })
+# misspelled name
+to_explain[[1]] <- rename(to_explain[[1]], `maillard sylvain` = `7lard sylvain`)
+names(to_explain) <- map_chr(to_explain, \(x) names(x)[2])
+
+explicative_elections <- elections |>
+  filter(year >= 2017, round == 1, !(type == "legislatives" & year == 2024)) |>
+  select(type, year, round) |>
+  unique()
+
+regressions <- to_explain |>
+  map(function(to_exp) {
+    to_exp <- to_exp |> rename_with(\(x) str_c(x, "_exp"), .cols = -id_bvote)
+
+    # Return the list of the six regressions using explicative_elections as explanatory variables
+    explicative_elections |>
+    pmap(function(type, year, round) {
+      # Compute the linear regression of df using the election (type, year, round)
+      collect_election(type, year, round) |>
+        inner_join(x = to_exp, multiple = "any", by = "id_bvote") |>
+        relocate(2, .after = nb_exprim) |>
+        candidates(keep = id_bvote) |>
+        column_to_rownames("id_bvote") |>
+        lm(formula = str_glue("`{names(to_exp)[2]}` ~ ."))
+    }) |>
+    set_names(str_glue_data(explicative_elections, "{type}_{year}"))
+
+  })
+
+summaries <- map(regressions, \(x) map(x, summary))
+
+```
+
+The goal of this section is to explain the results of the 2024 legislative election using the previous elections (2017-2024) as explanatory variables. We chose to only try to explain the results of the winner of each constituency because otherwise there would be too many variables (there are already 18 winners). We also focus on explaining these results using the first round of each explanatory election because they are more informative about the underlying political dynamics: it would be strange to try to explain the results of a left-wing candidate using the results of a second round in which the left-wing candidate is not even present.
+
+We therefore collect the available data for elections since 2017, extract the candidates' results and run a linear regression for each winner of the 2024 legislative election using the results of the previous elections as explanatory variables. The following bar charts summarize the adjusted R-squared of each regression, which gives us an idea of how well each previous election explains the 2024 results.
+
+```{r}
+#| label: lin-reg-bar
+#| lightbox:
+#|  group: lin-reg-bar
+#| layout-ncol: 4
+
+summaries |>
+  imap(function(regs, name) {
+    map_dbl(regs, \(x) x$adj.r.squared) |>
+    enframe(name = "election", value = "r_squared") |>
+    mutate(fill = r_squared == max(r_squared)) |>
+    ggplot(aes(x = election, y = r_squared, fill = fill)) +
+    geom_col() +
+    geom_text(aes(label = round(r_squared, 3)), vjust = -0.5) +
+    labs(x = NULL, title = str_glue("Adjusted R-squared for {format_names(name)}")) +
+    scale_fill_manual(values = c("lightgrey", "steelblue"), guide = "none") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+  }) |>
+  walk(print)
+
+```
+
+The results show that for most candidates, the previous european election (2024) is the best explanatory variable, which is not very surprising since it is the most recent election. However, for some candidates, other elections are better predictors of their 2024 performance. For example, the 2022 presidential election is a better predictor for the first and last candidate. This could be due to the fact that these candidates were already present previously and have maintained an electorate since then.
+
+Let us now have a closer look at the regression done using the 2024 European election as an explanatory variable, since it is the best predictor for most candidates. The following graph summarizes the coefficients of these regressions for each candidate:
+
+```{r}
+#| label: lin-reg-coef
+#| lightbox:
+#|  group: lin-reg-coef
+#| layout-ncol: 4
+
+summaries |>
+  map("europeennes_2024") |>
+  imap(function(reg, name) {
+    reg$coefficients[-1, "Estimate"] |>
+    enframe(name = "candidate", value = "coefficient") |>
+    ggplot(aes(x = fct_reorder(format_names(candidate), coefficient, .desc = TRUE), y = coefficient)) +
+    geom_col(fill = "steelblue") +
+    labs(x = NULL, title = str_glue("Coefficients for {format_names(name)}")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+  }) |>
+  walk(print)
+
+```
+
+The coefficients show that for most candidates, the most important explanatory variable is the result of the candidate with the same political affiliation in the 2024 european election. For example, for *Sandrine Rousseau* (ninth candidate), the coefficient of the *Lorys Elmayan* variable is much higher than the others, which suggests that *Rousseau's* performance in the 2024 legislative election is strongly correlated with the performance of *Elmayan* in the 2024 european election. This is consistent with the fact that both candidates are from the same political family (ecologists) and therefore likely share a similar electorate.

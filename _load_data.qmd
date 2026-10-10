@@ -1,0 +1,101 @@
+{{< include _download.qmd >}}
+
+```{r}
+#| label: load-libraries
+
+library(arrow)
+library(readxl)
+
+```
+
+```{r}
+#| label: load-functions
+
+unused_cols <- c(
+  "sec_bv", "objectid", "created_user", "created_date", "last_edited_user",
+  "last_edited_date", "st_area_shape", "st_perimeter_shape"
+)
+
+# Name standardization for the two datasets that are different from the others
+cols_mapping <- c(
+  id_bv = "id_bvote",
+  type_election = "scrutin",
+  numero_tour = "tour",
+  date_tour = "date",
+  circ_bv = "num_circ",
+  quartier_bv = "num_quartier",
+  arr_bv = "num_arrond",
+  nb_procuration = "nb_procu",
+  nb_inscrit = "nb_inscr",
+  inscrits = "nb_inscr",
+  nb_emargement = "nb_emarg",
+  nb_vote_blanc = "nb_blanc",
+  nb_bl = "nb_blanc",
+  nb_vote_nul = "nb_nul",
+  nb_exprime = "nb_exprim"
+)
+
+# columns name and type standardization
+standardize <- function(df) {
+  df <- df |>
+    rename_with(str_to_lower) |>
+    rename_with(\(old) coalesce(cols_mapping[old], old)) |>
+    select(!any_of(unused_cols)) |>
+    filter(
+      # the 2014 european elections have a row with only NAs
+      !is.na(id_bvote),
+      # remove the polling station for prisoners
+      !str_ends(id_bvote, "99")
+    )
+
+  if ("nb_blanc" %in% names(df)) {
+    df <- df |>
+      mutate(nb_bl_nul = nb_blanc + nb_nul, .keep = "unused") |>
+      relocate(nb_bl_nul, .before = nb_exprim)
+  }
+
+  if (inherits(df$annee, "Date")) df <- mutate(df, annee = year(annee))
+
+  if (inherits(df$date, "POSIXct")) df <- mutate(df, date = as_date(date))
+  else if (is.character(df$date)) df <- mutate(df, date = dmy(date))
+
+  df <- df |> mutate(
+    across(
+      c(annee, num_circ, num_quartier, num_arrond),
+      \(col) if (is.character(col)) as.numeric(col) else col
+    )
+  )
+
+  df
+}
+
+# Read a parque file and standardize columns
+load_parquet <- function(path) standardize(read_parquet(path))
+
+# Read an excel file and standardize columns
+load_excel <- function(path) standardize(read_excel(path))
+
+```
+
+```{r}
+#| label: load
+
+pres_euro <- mutate(pres_euro, data = map(path, load_parquet))
+
+# one of the excel file is ill-formatted so this will produce a warning but we can ignore it
+legi_muni <- mutate(legi_muni, data = map(path, load_excel)) |> suppressWarnings()
+
+# group all the election in a data frame and clear variables
+elections <- bind_rows(
+  pres_euro |> select(!c(dataset, path)),
+  legi_muni |> select(!c(dataset, path, attachement))
+) |> relocate(constituency, .before = data)
+
+```
+
+```{r}
+#| label: load-clean
+
+rm(unused_cols, cols_mapping, standardize, load_parquet, load_excel, fixed, pres_euro, legi_muni)
+
+```
